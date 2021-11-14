@@ -50,3 +50,11 @@ private:
 };
 
 #endif
+
+/*
+实际上这个buffer封装了很多有用的操作在里面：
+比较关键的理解在于readPos_和writePos_。
+readPos_指向的是任何时刻buffer中可以被读取的第一个字符
+writePos_指向的是任何时刻写入buffer的最后一个字符
+
+*/
