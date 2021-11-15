@@ -1,0 +1,6 @@
+2021-11-15 19:57:19.652794 [info] : ========Server init==========
+2021-11-15 19:57:19.652809 [info] : Port:12345, OpenLinger: false
+2021-11-15 19:57:19.652813 [info] : Listen Mode: ET, OpenConn Mode: ET
+2021-11-15 19:57:19.652854 [info] : LogSys level: 1
+2021-11-15 19:57:19.652857 [info] : srcDir: /home/helix/webserver-demo/resource/
+2021-11-15 19:57:19.653575 [info] : SqlConnPool num: 12, ThreadPool num: 6
