@@ -12,7 +12,7 @@ WebServer::WebServer(
 {
     srcDir_ = getcwd(nullptr,256);
     assert(srcDir_);
-    strncat(srcDir_,"/resource/",16);
+    strncat(srcDir_,"/resources/",16);
     HttpConn::userCount = 0;
     HttpConn::srcDir = srcDir_;
     SqlConnPool::Instance()->Init("localhost",sqlPort,sqlUser,sqlPwd,dbName,connPoolNum);
@@ -281,6 +281,14 @@ bool WebServer::InitSocket_()
 
     ret = listen(listenFd_,6);
     if(ret<0)
+    {
+        LOG_ERROR("Listen port:%d error!",port_);
+        close(listenFd_);
+        return false;
+    }
+
+    ret = epoller_->AddFd(listenFd_,listenEvent_ | EPOLLIN);
+    if(ret == 0)
     {
         LOG_ERROR("Add listen error!");
         close(listenFd_);

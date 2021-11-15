@@ -90,7 +90,7 @@ void BlockDeque<T>::Close()
 template<class T>
 void BlockDeque<T>::flush()
 {
-    condConsumer_.notify_all();
+    condConsumer_.notify_one();
 }
 
 template<class T>
@@ -148,7 +148,7 @@ void BlockDeque<T>::push_front(const T& item)
     {
         condProducer_.wait(locker);
     }
-    deq_.push_back(item);
+    deq_.push_front(item);
     condProducer_.notify_one();
 }
 

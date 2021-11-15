@@ -119,8 +119,8 @@ void HttpRequest::ParseBody_(const string& line)
 
 int HttpRequest::ConverHex(char ch)
 {
-    if(ch >= 'A' && ch <= 'Z') return ch -'A' +10;
-    if(ch >= 'a' && ch <= 'z') return ch -'a'+10;
+    if(ch >= 'A' && ch <= 'F') return ch -'A' +10;
+    if(ch >= 'a' && ch <= 'f') return ch -'a'+10;
     return ch;
 }
 
@@ -221,7 +221,7 @@ bool HttpRequest::UserVerify(const string& name,const string& pwd,bool isLogin)
     }
     res = mysql_store_result(sql);
     j = mysql_num_fields(res);
-    fields = mysql_fetch_field(res);
+    fields = mysql_fetch_fields(res);
 
     while(MYSQL_ROW row = mysql_fetch_row(res))
     {
