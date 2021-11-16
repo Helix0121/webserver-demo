@@ -1,77 +1,69 @@
 #ifndef LOG_H
 #define LOG_H
 
-#include<mutex>
-#include<string>
-#include<thread>
-#include<sys/time.h>
-#include<string.h>
-#include<stdarg.h>
-#include<assert.h>
-#include<sys/stat.h>
-#include"blockqueue.h"
-#include"../buffer/buffer.h"
+#include <stdio.h>
+#include <iostream>
+#include <string>
+#include <stdarg.h>
+#include <pthread.h>
+#include "blockqueue.h"
+
+using namespace std;
 
 class Log
 {
 public:
-    void init(int level,const char* path = "./log",
-        const char* suffix = ".log",
-        int maxQueueCapacity = 1024);
+    //C++11以后,使用局部变量懒汉不用加锁
+    static Log *get_instance()
+    {
+        static Log instance;
+        return &instance;
+    }
 
-    static Log* Instance();
-    static void FlushLogThread();
+    static void *flush_log_thread(void *args)
+    {
+        Log::get_instance()->async_write_log();
+    }
+    //可选择的参数有日志文件、日志缓冲区大小、最大行数以及最长日志条队列
+    bool init(const char *file_name, int close_log, int log_buf_size = 8192, int split_lines = 5000000, int max_queue_size = 0);
 
-    void write(int level,const char* format,...);
-    void flush();
+    void write_log(int level, const char *format, ...);
 
-    int GetLevel();
-    void SetLevel(int level);
-    bool IsOpen() { return isOpen_;}
+    void flush(void);
 
 private:
     Log();
-    void AppendLogLevelTitle_(int level);
     virtual ~Log();
-    void AsyncWrite_();
+    void *async_write_log()
+    {
+        string single_log;
+        //从阻塞队列中取出一个日志string，写入文件
+        while (m_log_queue->pop(single_log))
+        {
+            m_mutex.lock();
+            fputs(single_log.c_str(), m_fp);
+            m_mutex.unlock();
+        }
+    }
 
 private:
-    static const int LOG_PATH_LEN = 256;
-    static const int LOG_NAME_LEN = 256;
-    static const int MAX_LINES = 50000;
-
-    const char* path_;
-    const char* suffix_;
-
-    int MAX_LINES_;
-
-    int lineCount_;
-    int toDay_;
-
-    bool isOpen_;
-
-    Buffer buff_;
-    int level_;
-    bool isAsync_;
-
-    FILE* fp_;
-    std::unique_ptr<BlockDeque<std::string>> deque_;
-    std::unique_ptr<std::thread> writeThread_;
-    std::mutex mtx_;
+    char dir_name[128]; //路径名
+    char log_name[128]; //log文件名
+    int m_split_lines;  //日志最大行数
+    int m_log_buf_size; //日志缓冲区大小
+    long long m_count;  //日志行数记录
+    int m_today;        //因为按天分类,记录当前时间是那一天
+    FILE *m_fp;         //打开log的文件指针
+    char *m_buf;
+    block_queue<string> *m_log_queue; //阻塞队列
+    bool m_is_async;                  //是否同步标志位
+    locker m_mutex;
+    int m_close_log; //关闭日志
 };
 
-#define LOG_BASE(level,format,...) \
-    do{\
-        Log* log = Log::Instance();\
-        if(log->IsOpen() && log->GetLevel() <= level) {\
-            log->write(level,format,##__VA_ARGS__); \
-            log->flush();\
-        }\
-    }while (0);
-
-#define LOG_DEBUG(format,...) do{LOG_BASE(0,format,##__VA_ARGS__)} while(0);
-#define LOG_INFO(format,...) do{LOG_BASE(1,format,##__VA_ARGS__)} while(0);
-#define LOG_WARN(format,...) do{LOG_BASE(2,format,##__VA_ARGS__)} while(0);
-#define LOG_ERROR(format,...) do{LOG_BASE(3,format,##__VA_ARGS__)} while(0);
+#define LOG_DEBUG(format, ...) if(0 == m_close_log) {Log::get_instance()->write_log(0, format, ##__VA_ARGS__); Log::get_instance()->flush();}
+#define LOG_INFO(format, ...) if(0 == m_close_log) {Log::get_instance()->write_log(1, format, ##__VA_ARGS__); Log::get_instance()->flush();}
+#define LOG_WARN(format, ...) if(0 == m_close_log) {Log::get_instance()->write_log(2, format, ##__VA_ARGS__); Log::get_instance()->flush();}
+#define LOG_ERROR(format, ...) if(0 == m_close_log) {Log::get_instance()->write_log(3, format, ##__VA_ARGS__); Log::get_instance()->flush();}
 
 #endif

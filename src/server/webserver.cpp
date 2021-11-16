@@ -1,306 +1,434 @@
-#include"webserver.h"
+#include "webserver.h"
 
-using namespace std;
-
-WebServer::WebServer(
-    int port, int trigMode, int timeoutMS, bool OptLinger,
-            int sqlPort, const char* sqlUser, const  char* sqlPwd,
-            const char* dbName, int connPoolNum, int threadNum,
-            bool openLog, int logLevel, int logQueSize):
-            port_(port), openLinger_(OptLinger), timeoutMS_(timeoutMS), isClose_(false),
-            timer_(new HeapTimer()), threadpool_(new ThreadPool(threadNum)), epoller_(new Epoller())
+WebServer::WebServer()
 {
-    srcDir_ = getcwd(nullptr,256);
-    assert(srcDir_);
-    strncat(srcDir_,"/resources/",16);
-    HttpConn::userCount = 0;
-    HttpConn::srcDir = srcDir_;
-    SqlConnPool::Instance()->Init("localhost",sqlPort,sqlUser,sqlPwd,dbName,connPoolNum);
+    //http_conn类对象
+    users = new http_conn[MAX_FD];
 
-    InitEventMode_(trigMode);
-    if(!InitSocket_()){isClose_ = true;}
+    //root文件夹路径
+    char server_path[200];
+    getcwd(server_path, 200);
+    char root[6] = "/root";
+    m_root = (char *)malloc(strlen(server_path) + strlen(root) + 1);
+    strcpy(m_root, server_path);
+    strcat(m_root, root);
 
-    if(openLog)
-    {
-        Log::Instance()->init(logLevel,"./log",".log",logQueSize);
-        if(isClose_) { LOG_ERROR("========Server init error!=========");}
-        else
-        {
-            LOG_INFO("========Server init==========");
-            LOG_INFO("Port:%d, OpenLinger: %s",port_,OptLinger ? "true" : "false");
-            LOG_INFO("Listen Mode: %s, OpenConn Mode: %s",
-                (listenEvent_& EPOLLET ? "ET" : "LT"),
-                (connEvent_ & EPOLLET ? "ET" : "LT"));
-            LOG_INFO("LogSys level: %d",logLevel);
-            LOG_INFO("srcDir: %s",HttpConn::srcDir);
-            LOG_INFO("SqlConnPool num: %d, ThreadPool num: %d",connPoolNum,threadNum);
-        }
-    }   
+    //定时器
+    users_timer = new client_data[MAX_FD];
 }
 
 WebServer::~WebServer()
 {
-    close(listenFd_);
-    isClose_ = true;
-    free(srcDir_);
-    SqlConnPool::Instance()->ClosePool();
+    close(m_epollfd);
+    close(m_listenfd);
+    close(m_pipefd[1]);
+    close(m_pipefd[0]);
+    delete[] users;
+    delete[] users_timer;
+    delete m_pool;
 }
 
-void WebServer::InitEventMode_(int trigMode)
+void WebServer::init(int port, string user, string passWord, string databaseName, int log_write, 
+                     int opt_linger, int trigmode, int sql_num, int thread_num, int close_log, int actor_model)
 {
-    listenEvent_ = EPOLLRDHUP;
-    connEvent_ = EPOLLRDHUP | EPOLLONESHOT;
-    switch(trigMode)
+    m_port = port;
+    m_user = user;
+    m_passWord = passWord;
+    m_databaseName = databaseName;
+    m_sql_num = sql_num;
+    m_thread_num = thread_num;
+    m_log_write = log_write;
+    m_OPT_LINGER = opt_linger;
+    m_TRIGMode = trigmode;
+    m_close_log = close_log;
+    m_actormodel = actor_model;
+}
+
+void WebServer::trig_mode()
+{
+    //LT + LT
+    if (0 == m_TRIGMode)
     {
-        case 0:
-            break;
-        case 1:
-            connEvent_ |= EPOLLET;
-            break;        
-        case 2:
-            listenEvent_ |= EPOLLET;
-            break;
-        case 3:
-            listenEvent_ |= EPOLLET;
-            connEvent_ |= EPOLLET;
-            break;
-        default:
-            listenEvent_ |= EPOLLET;
-            connEvent_ |= EPOLLET;
-            break;
+        m_LISTENTrigmode = 0;
+        m_CONNTrigmode = 0;
     }
-    HttpConn::isET = (connEvent_ & EPOLLET);
+    //LT + ET
+    else if (1 == m_TRIGMode)
+    {
+        m_LISTENTrigmode = 0;
+        m_CONNTrigmode = 1;
+    }
+    //ET + LT
+    else if (2 == m_TRIGMode)
+    {
+        m_LISTENTrigmode = 1;
+        m_CONNTrigmode = 0;
+    }
+    //ET + ET
+    else if (3 == m_TRIGMode)
+    {
+        m_LISTENTrigmode = 1;
+        m_CONNTrigmode = 1;
+    }
 }
 
-void WebServer::Start()
+void WebServer::log_write()
 {
-    int timeMs = -1;
-    if(!isClose_) { LOG_INFO("==============Server start=============");}
-    while(!isClose_)
+    if (0 == m_close_log)
     {
-        if(timeoutMS_ > 0)
-            timeMs = timer_->GetNextTick();
-        
-        int eventCnt = epoller_->Wait(timeMs);
-        for(int i=0;i<eventCnt;i++)
+        //初始化日志
+        if (1 == m_log_write)
+            Log::get_instance()->init("./ServerLog", m_close_log, 2000, 800000, 800);
+        else
+            Log::get_instance()->init("./ServerLog", m_close_log, 2000, 800000, 0);
+    }
+}
+
+void WebServer::sql_pool()
+{
+    //初始化数据库连接池
+    m_connPool = connection_pool::GetInstance();
+    m_connPool->init("localhost", m_user, m_passWord, m_databaseName, 3306, m_sql_num, m_close_log);
+
+    //初始化数据库读取表
+    users->initmysql_result(m_connPool);
+}
+
+void WebServer::thread_pool()
+{
+    //线程池
+    m_pool = new threadpool<http_conn>(m_actormodel, m_connPool, m_thread_num);
+}
+
+void WebServer::eventListen()
+{
+    //网络编程基础步骤
+    m_listenfd = socket(PF_INET, SOCK_STREAM, 0);
+    assert(m_listenfd >= 0);
+
+    //优雅关闭连接
+    if (0 == m_OPT_LINGER)
+    {
+        struct linger tmp = {0, 1};
+        setsockopt(m_listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof(tmp));
+    }
+    else if (1 == m_OPT_LINGER)
+    {
+        struct linger tmp = {1, 1};
+        setsockopt(m_listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof(tmp));
+    }
+
+    int ret = 0;
+    struct sockaddr_in address;
+    bzero(&address, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(m_port);
+
+    int flag = 1;
+    setsockopt(m_listenfd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+    ret = bind(m_listenfd, (struct sockaddr *)&address, sizeof(address));
+    assert(ret >= 0);
+    ret = listen(m_listenfd, 5);
+    assert(ret >= 0);
+
+    utils.init(TIMESLOT);
+
+    //epoll创建内核事件表
+    epoll_event events[MAX_EVENT_NUMBER];
+    m_epollfd = epoll_create(5);
+    assert(m_epollfd != -1);
+
+    utils.addfd(m_epollfd, m_listenfd, false, m_LISTENTrigmode);
+    http_conn::m_epollfd = m_epollfd;
+
+    ret = socketpair(PF_UNIX, SOCK_STREAM, 0, m_pipefd);
+    assert(ret != -1);
+    utils.setnonblocking(m_pipefd[1]);
+    utils.addfd(m_epollfd, m_pipefd[0], false, 0);
+
+    utils.addsig(SIGPIPE, SIG_IGN);
+    utils.addsig(SIGALRM, utils.sig_handler, false);
+    utils.addsig(SIGTERM, utils.sig_handler, false);
+
+    alarm(TIMESLOT);
+
+    //工具类,信号和描述符基础操作
+    Utils::u_pipefd = m_pipefd;
+    Utils::u_epollfd = m_epollfd;
+}
+
+void WebServer::timer(int connfd, struct sockaddr_in client_address)
+{
+    users[connfd].init(connfd, client_address, m_root, m_CONNTrigmode, m_close_log, m_user, m_passWord, m_databaseName);
+
+    //初始化client_data数据
+    //创建定时器，设置回调函数和超时时间，绑定用户数据，将定时器添加到链表中
+    users_timer[connfd].address = client_address;
+    users_timer[connfd].sockfd = connfd;
+    util_timer *timer = new util_timer;
+    timer->user_data = &users_timer[connfd];
+    timer->cb_func = cb_func;
+    time_t cur = time(NULL);
+    timer->expire = cur + 3 * TIMESLOT;
+    users_timer[connfd].timer = timer;
+    utils.m_timer_lst.add_timer(timer);
+}
+
+//若有数据传输，则将定时器往后延迟3个单位
+//并对新的定时器在链表上的位置进行调整
+void WebServer::adjust_timer(util_timer *timer)
+{
+    time_t cur = time(NULL);
+    timer->expire = cur + 3 * TIMESLOT;
+    utils.m_timer_lst.adjust_timer(timer);
+
+    LOG_INFO("%s", "adjust timer once");
+}
+
+void WebServer::deal_timer(util_timer *timer, int sockfd)
+{
+    timer->cb_func(&users_timer[sockfd]);
+    if (timer)
+    {
+        utils.m_timer_lst.del_timer(timer);
+    }
+
+    LOG_INFO("close fd %d", users_timer[sockfd].sockfd);
+}
+
+bool WebServer::dealclinetdata()
+{
+    struct sockaddr_in client_address;
+    socklen_t client_addrlength = sizeof(client_address);
+    if (0 == m_LISTENTrigmode)
+    {
+        int connfd = accept(m_listenfd, (struct sockaddr *)&client_address, &client_addrlength);
+        if (connfd < 0)
         {
-            int fd = epoller_->GetEventFd(i);
-            uint32_t events = epoller_->GetEvents(i);
-            if(fd == listenFd_)
-                DealListen_();
-            else if(events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
-            {
-                assert(users_.count(fd) > 0);
-                CloseConn_(&users_[fd]);
-            }
-            else if(events &  EPOLLIN)
-            {
-                assert(users_.count(fd) > 0);
-                DealRead_(&users_[fd]);
-            }
-            else if(events & EPOLLOUT)
-            {
-                assert(users_.count(fd) > 0);
-                DealWrite_(&users_[fd]);
-            }
-            else
-                LOG_ERROR("Unexpected event");
+            LOG_ERROR("%s:errno is:%d", "accept error", errno);
+            return false;
         }
-    }
-}
-
-void WebServer::SendError(int fd,const char* info)
-{
-    assert(fd > 0);
-    int ret = send(fd,info,strlen(info),0);
-    if(ret<0)
-        LOG_WARN("send error to client[%d] error!",fd);
-    close(fd);
-}
-
-void WebServer::CloseConn_(HttpConn* client)
-{
-    assert(client);
-    LOG_INFO("Client[%d] quit!",client->GetFd());
-    epoller_->DelFd(client->GetFd());
-    client->Close();
-}
-
-void WebServer::AddClient_(int fd,sockaddr_in addr)
-{
-    assert(fd>0);
-    users_[fd].init(fd,addr);
-    if(timeoutMS_ > 0)
-        timer_->add(fd,timeoutMS_,std::bind(&WebServer::CloseConn_,this,&users_[fd]));
-    epoller_->AddFd(fd,EPOLLIN | connEvent_);
-    SetFdNonblock(fd);
-    LOG_INFO("Client[%d] in!",users_[fd].GetFd());
-}
-
-void WebServer::DealListen_()
-{
-    struct sockaddr_in addr;
-    socklen_t len = sizeof(addr);
-
-    do
-    {
-        int fd = accept(listenFd_,(struct sockaddr *)&addr,&len);
-        if(fd <= 0) return;
-        else if(HttpConn::userCount >= MAX_FD)
+        if (http_conn::m_user_count >= MAX_FD)
         {
-            SendError(fd,"Server Busy");
-            LOG_WARN("Client is full!");
-            return;
+            utils.show_error(connfd, "Internal server busy");
+            LOG_ERROR("%s", "Internal server busy");
+            return false;
         }
-        AddClient_(fd,addr);
-    }while(listenEvent_ & EPOLLIN);
-}
-
-void WebServer::DealRead_(HttpConn* client)
-{
-    assert(client);
-    ExtentTime_(client);
-    threadpool_->AddTask(std::bind(&WebServer::OnRead_,this,client));
-}
-
-void WebServer::DealWrite_(HttpConn* client)
-{
-    assert(client);
-    ExtentTime_(client);
-    threadpool_->AddTask(std::bind(&WebServer::OnWrite_,this,client));
-}
-
-void WebServer::ExtentTime_(HttpConn* client)
-{
-    assert(client);
-    if(timeoutMS_ > 0) {timer_->adjust(client->GetFd(),timeoutMS_);}
-}
-
-void WebServer::OnRead_(HttpConn* client)
-{
-    assert(client);
-    int ret = -1;
-    int readErrno = 0;
-    ret = client->read(&readErrno);
-    if(ret<=0&& readErrno!=EAGAIN)
-    {
-        CloseConn_(client);
-        return ;
+        timer(connfd, client_address);
     }
-    OnProcess(client);
-}
 
-void WebServer::OnProcess(HttpConn* client)
-{
-    if(client->process())
-        epoller_->ModFd(client->GetFd(),connEvent_ | EPOLLOUT);
     else
-        epoller_->ModFd(client->GetFd(),connEvent_ | EPOLLIN);
-}
-
-void WebServer::OnWrite_(HttpConn* client)
-{
-    assert(client);
-    int ret = -1;
-    int writeErrno = 0;
-    ret = client->write(&writeErrno);
-    if(client->ToWriteBytes() == 0)
     {
-        //传输完成
-        if(client->isKeepAlive())
+        while (1)
         {
-            OnProcess(client);
-            return;
+            int connfd = accept(m_listenfd, (struct sockaddr *)&client_address, &client_addrlength);
+            if (connfd < 0)
+            {
+                LOG_ERROR("%s:errno is:%d", "accept error", errno);
+                break;
+            }
+            if (http_conn::m_user_count >= MAX_FD)
+            {
+                utils.show_error(connfd, "Internal server busy");
+                LOG_ERROR("%s", "Internal server busy");
+                break;
+            }
+            timer(connfd, client_address);
         }
-    }
-    else if(ret < 0)
-    {
-        if(writeErrno == EAGAIN)
-        {
-            //继续传输
-            epoller_->ModFd(client->GetFd(),connEvent_ | EPOLLOUT);
-            return;
-        }
-    }
-    CloseConn_(client);
-}
-
-bool WebServer::InitSocket_()
-{
-    int ret;
-    struct sockaddr_in addr;
-    if(port_>65535 || port_ < 1024)
-    {
-        LOG_ERROR("Port:%d error!",port_);
         return false;
     }
-
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port_);
-    struct linger optLinger = {0};
-    if(openLinger_)
-    {
-        //优雅关闭
-        optLinger.l_onoff = 1;
-        optLinger.l_linger = 1;
-    }
-
-    listenFd_ = socket(AF_INET,SOCK_STREAM,0);
-    if(listenFd_<0)
-    {
-        LOG_ERROR("Create socket error!",port_);
-        return false;
-    }
-
-    ret = setsockopt(listenFd_,SOL_SOCKET,SO_LINGER,&optLinger,sizeof(optLinger));
-    if(ret<0)
-    {
-        close(listenFd_);
-        LOG_ERROR("Init linger error!",port_);
-        return false;
-    }
-
-    int optval = 1;
-    //端口复用
-    ret = setsockopt(listenFd_,SOL_SOCKET,SO_REUSEADDR,(const void*)&optval,sizeof(int));
-    if(ret == -1)
-    {
-        LOG_ERROR("set socket setsockopt error!");
-        close(listenFd_);
-        return false;
-    }
-
-    ret = bind(listenFd_,(struct sockaddr *)&addr,sizeof(addr));
-    if(ret<0)
-    {
-        LOG_ERROR("Bind Port:%d error!",port_);
-        close(listenFd_);
-        return false;
-    }
-
-    ret = listen(listenFd_,6);
-    if(ret<0)
-    {
-        LOG_ERROR("Listen port:%d error!",port_);
-        close(listenFd_);
-        return false;
-    }
-
-    ret = epoller_->AddFd(listenFd_,listenEvent_ | EPOLLIN);
-    if(ret == 0)
-    {
-        LOG_ERROR("Add listen error!");
-        close(listenFd_);
-        return false;
-    }
-    SetFdNonblock(listenFd_);
-    LOG_INFO("Server port:%d",port_);
     return true;
 }
 
-int WebServer::SetFdNonblock(int fd)
+bool WebServer::dealwithsignal(bool &timeout, bool &stop_server)
 {
-    assert(fd>0);
-    return fcntl(fd,F_SETFL,fcntl(fd,F_GETFD,0) | O_NONBLOCK);
+    int ret = 0;
+    int sig;
+    char signals[1024];
+    ret = recv(m_pipefd[0], signals, sizeof(signals), 0);
+    if (ret == -1)
+    {
+        return false;
+    }
+    else if (ret == 0)
+    {
+        return false;
+    }
+    else
+    {
+        for (int i = 0; i < ret; ++i)
+        {
+            switch (signals[i])
+            {
+            case SIGALRM:
+            {
+                timeout = true;
+                break;
+            }
+            case SIGTERM:
+            {
+                stop_server = true;
+                break;
+            }
+            }
+        }
+    }
+    return true;
+}
+
+void WebServer::dealwithread(int sockfd)
+{
+    util_timer *timer = users_timer[sockfd].timer;
+
+    //reactor
+    if (1 == m_actormodel)
+    {
+        if (timer)
+        {
+            adjust_timer(timer);
+        }
+
+        //若监测到读事件，将该事件放入请求队列
+        m_pool->append(users + sockfd, 0);
+
+        while (true)
+        {
+            if (1 == users[sockfd].improv)
+            {
+                if (1 == users[sockfd].timer_flag)
+                {
+                    deal_timer(timer, sockfd);
+                    users[sockfd].timer_flag = 0;
+                }
+                users[sockfd].improv = 0;
+                break;
+            }
+        }
+    }
+    else
+    {
+        //proactor
+        if (users[sockfd].read_once())
+        {
+            LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
+
+            //若监测到读事件，将该事件放入请求队列
+            m_pool->append_p(users + sockfd);
+
+            if (timer)
+            {
+                adjust_timer(timer);
+            }
+        }
+        else
+        {
+            deal_timer(timer, sockfd);
+        }
+    }
+}
+
+void WebServer::dealwithwrite(int sockfd)
+{
+    util_timer *timer = users_timer[sockfd].timer;
+    //reactor
+    if (1 == m_actormodel)
+    {
+        if (timer)
+        {
+            adjust_timer(timer);
+        }
+
+        m_pool->append(users + sockfd, 1);
+
+        while (true)
+        {
+            if (1 == users[sockfd].improv)
+            {
+                if (1 == users[sockfd].timer_flag)
+                {
+                    deal_timer(timer, sockfd);
+                    users[sockfd].timer_flag = 0;
+                }
+                users[sockfd].improv = 0;
+                break;
+            }
+        }
+    }
+    else
+    {
+        //proactor
+        if (users[sockfd].write())
+        {
+            LOG_INFO("send data to the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
+
+            if (timer)
+            {
+                adjust_timer(timer);
+            }
+        }
+        else
+        {
+            deal_timer(timer, sockfd);
+        }
+    }
+}
+
+void WebServer::eventLoop()
+{
+    bool timeout = false;
+    bool stop_server = false;
+
+    while (!stop_server)
+    {
+        int number = epoll_wait(m_epollfd, events, MAX_EVENT_NUMBER, -1);
+        if (number < 0 && errno != EINTR)
+        {
+            LOG_ERROR("%s", "epoll failure");
+            break;
+        }
+
+        for (int i = 0; i < number; i++)
+        {
+            int sockfd = events[i].data.fd;
+
+            //处理新到的客户连接
+            if (sockfd == m_listenfd)
+            {
+                bool flag = dealclinetdata();
+                if (false == flag)
+                    continue;
+            }
+            else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+            {
+                //服务器端关闭连接，移除对应的定时器
+                util_timer *timer = users_timer[sockfd].timer;
+                deal_timer(timer, sockfd);
+            }
+            //处理信号
+            else if ((sockfd == m_pipefd[0]) && (events[i].events & EPOLLIN))
+            {
+                bool flag = dealwithsignal(timeout, stop_server);
+                if (false == flag)
+                    LOG_ERROR("%s", "dealclientdata failure");
+            }
+            //处理客户连接上接收到的数据
+            else if (events[i].events & EPOLLIN)
+            {
+                dealwithread(sockfd);
+            }
+            else if (events[i].events & EPOLLOUT)
+            {
+                dealwithwrite(sockfd);
+            }
+        }
+        if (timeout)
+        {
+            utils.timer_handler();
+
+            LOG_INFO("%s", "timer tick");
+
+            timeout = false;
+        }
+    }
 }

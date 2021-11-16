@@ -1,12 +1,15 @@
-CXX=g++
-CFLAGS=-std=c++14 -O2 -Wall -g
+CXX ?= g++
 
-TARGET = server
-OBJS = src/log/*.cpp src/pool/*.cpp \
-	   src/timer/*.cpp src/http/*.cpp src/server/*.cpp \
-	   src/buffer/*.cpp src/main.cpp
+DEBUG ?= 1
+ifeq ($(DEBUG), 1)
+    CXXFLAGS += -g
+else
+    CXXFLAGS += -O2
 
-all: $(OBJS)
-	$(CXX) $(CFLAGS) $(OBJS) -o $(TARGET) -pthread -lmysqlclient
+endif
+
+server: src/main.cpp  src/timer/lst_timer.cpp src/http/httpconn.cpp src/log/log.cpp src/pool/sql_connection_pool.cpp  src/server/webserver.cpp src/config/config.cpp
+	$(CXX) -o server  $^ $(CXXFLAGS) -lpthread -lmysqlclient
+
 clean:
-	rm -rf $(TARGET)
+	rm  -r server

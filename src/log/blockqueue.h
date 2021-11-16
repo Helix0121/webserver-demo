@@ -1,202 +1,209 @@
-/*
-******************************************
-阻塞队列的实现，用于后面实现日志系统。
-******************************************
-*/
-#ifndef BLOCKQUEUE_H
-#define BLOCKQUEUE_H
 
-#include<mutex>
-#include<deque>
-#include<condition_variable>
-#include<sys/time.h>
-#include<assert.h>
 
-template<class T>
-class BlockDeque
+#ifndef BLOCK_QUEUE_H
+#define BLOCK_QUEUE_H
+
+#include <iostream>
+#include <stdlib.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include"../lock/locker.h"
+using namespace std;
+
+template <class T>
+class block_queue
 {
 public:
-    explicit BlockDeque(size_t MaxCapacity = 1000);
+    block_queue(int max_size = 1000)
+    {
+        if (max_size <= 0)
+        {
+            exit(-1);
+        }
 
-    ~BlockDeque();
+        m_max_size = max_size;
+        m_array = new T[max_size];
+        m_size = 0;
+        m_front = -1;
+        m_back = -1;
+    }
 
-    void clear();
+    void clear()
+    {
+        m_mutex.lock();
+        m_size = 0;
+        m_front = -1;
+        m_back = -1;
+        m_mutex.unlock();
+    }
 
-    bool empty();
+    ~block_queue()
+    {
+        m_mutex.lock();
+        if (m_array != NULL)
+            delete [] m_array;
 
-    bool full();
+        m_mutex.unlock();
+    }
+    //判断队列是否满了
+    bool full() 
+    {
+        m_mutex.lock();
+        if (m_size >= m_max_size)
+        {
 
-    void Close();
+            m_mutex.unlock();
+            return true;
+        }
+        m_mutex.unlock();
+        return false;
+    }
+    //判断队列是否为空
+    bool empty() 
+    {
+        m_mutex.lock();
+        if (0 == m_size)
+        {
+            m_mutex.unlock();
+            return true;
+        }
+        m_mutex.unlock();
+        return false;
+    }
+    //返回队首元素
+    bool front(T &value) 
+    {
+        m_mutex.lock();
+        if (0 == m_size)
+        {
+            m_mutex.unlock();
+            return false;
+        }
+        value = m_array[m_front];
+        m_mutex.unlock();
+        return true;
+    }
+    //返回队尾元素
+    bool back(T &value) 
+    {
+        m_mutex.lock();
+        if (0 == m_size)
+        {
+            m_mutex.unlock();
+            return false;
+        }
+        value = m_array[m_back];
+        m_mutex.unlock();
+        return true;
+    }
 
-    size_t size();
+    int size() 
+    {
+        int tmp = 0;
 
-    size_t capacity();
+        m_mutex.lock();
+        tmp = m_size;
 
-    T front();
+        m_mutex.unlock();
+        return tmp;
+    }
 
-    T back();
+    int max_size()
+    {
+        int tmp = 0;
 
-    void push_back(const T& item);
+        m_mutex.lock();
+        tmp = m_max_size;
 
-    void push_front(const T& item);
+        m_mutex.unlock();
+        return tmp;
+    }
+    //往队列添加元素，需要将所有使用队列的线程先唤醒
+    //当有元素push进队列,相当于生产者生产了一个元素
+    //若当前没有线程等待条件变量,则唤醒无意义
+    bool push(const T &item)
+    {
 
-    bool pop(T& item);
+        m_mutex.lock();
+        if (m_size >= m_max_size)
+        {
 
-    bool pop(T& item,int timeout);
+            m_cond.broadcast();
+            m_mutex.unlock();
+            return false;
+        }
 
-    void flush();
+        m_back = (m_back + 1) % m_max_size;
+        m_array[m_back] = item;
+
+        m_size++;
+
+        m_cond.broadcast();
+        m_mutex.unlock();
+        return true;
+    }
+    //pop时,如果当前队列没有元素,将会等待条件变量
+    bool pop(T &item)
+    {
+
+        m_mutex.lock();
+        while (m_size <= 0)
+        {
+            
+            if (!m_cond.wait(m_mutex.get()))
+            {
+                m_mutex.unlock();
+                return false;
+            }
+        }
+
+        m_front = (m_front + 1) % m_max_size;
+        item = m_array[m_front];
+        m_size--;
+        m_mutex.unlock();
+        return true;
+    }
+
+    //增加了超时处理
+    bool pop(T &item, int ms_timeout)
+    {
+        struct timespec t = {0, 0};
+        struct timeval now = {0, 0};
+        gettimeofday(&now, NULL);
+        m_mutex.lock();
+        if (m_size <= 0)
+        {
+            t.tv_sec = now.tv_sec + ms_timeout / 1000;
+            t.tv_nsec = (ms_timeout % 1000) * 1000;
+            if (!m_cond.timewait(m_mutex.get(), t))
+            {
+                m_mutex.unlock();
+                return false;
+            }
+        }
+
+        if (m_size <= 0)
+        {
+            m_mutex.unlock();
+            return false;
+        }
+
+        m_front = (m_front + 1) % m_max_size;
+        item = m_array[m_front];
+        m_size--;
+        m_mutex.unlock();
+        return true;
+    }
 
 private:
-    std::deque<T> deq_;
+    locker m_mutex;
+    cond m_cond;
 
-    size_t capacity_;
-
-    std::mutex mtx_;
-
-    bool isClose_;
-
-    std::condition_variable condConsumer_;
-
-    std::condition_variable condProducer_;
-
+    T *m_array;
+    int m_size;
+    int m_max_size;
+    int m_front;
+    int m_back;
 };
 
-template<class T>
-BlockDeque<T>::BlockDeque(size_t MaxCapacity) : capacity_(MaxCapacity)
-{
-    assert(MaxCapacity > 0);
-    isClose_ = false;
-}
-
-template<class T>
-BlockDeque<T>::~BlockDeque()
-{
-    Close();
-}
-
-template<class T>
-void BlockDeque<T>::Close()
-{
-    {
-        std::lock_guard<std::mutex> locker(mtx_);//简化对mutex的上锁和解锁操作，属于是mutex的封装
-        //在构造的时候锁定一次并在销毁的时候解锁。
-        deq_.clear();
-        isClose_=true;
-    }
-    condProducer_.notify_all();
-    condConsumer_.notify_all();
-}
-
-template<class T>
-void BlockDeque<T>::flush()
-{
-    condConsumer_.notify_one();
-}
-
-template<class T>
-void BlockDeque<T>::clear()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    deq_.clear();
-}
-
-template<class T>
-T BlockDeque<T>::front()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    return deq_.front();
-}
-
-template<class T>
-T BlockDeque<T>::back()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    return deq_.back();
-}
-
-template<class T>
-size_t BlockDeque<T>::size()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    return deq_.size();
-}
-
-template<class T>
-size_t BlockDeque<T>::capacity()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    return capacity_;
-}
-
-template<class T>
-void BlockDeque<T>::push_back(const T& item)
-{
-    std::unique_lock<std::mutex> locker(mtx_);
-    while(deq_.size() >= capacity_)
-    {
-        condProducer_.wait(locker);
-    }
-    deq_.push_back(item);
-    condConsumer_.notify_one();
-}
-
-template<class T>
-void BlockDeque<T>::push_front(const T& item)
-{
-    std::unique_lock<std::mutex> locker(mtx_);
-    while(deq_.size() >= capacity_)
-    {
-        condProducer_.wait(locker);
-    }
-    deq_.push_front(item);
-    condProducer_.notify_one();
-}
-
-template<class T>
-bool BlockDeque<T>::empty()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    return deq_.empty();
-}
-
-template<class T>
-bool BlockDeque<T>::full()
-{
-    std::lock_guard<std::mutex> locker(mtx_);
-    return deq_.size() >= capacity_;
-}
-
-template<class T>
-bool BlockDeque<T>::pop(T& item)
-{
-    std::unique_lock<std::mutex> locker(mtx_);
-    while(deq_.empty())
-    {
-        condConsumer_.wait(locker);
-        if(isClose_)
-            return false;
-    }
-    item = deq_.front();
-    deq_.pop_front();
-    condProducer_.notify_one();
-    return true;
-}
-
-template<class T>
-bool BlockDeque<T>::pop(T& item,int timeout)
-{
-    std::unique_lock<std::mutex> locker(mtx_);
-    while(deq_.empty())
-    {
-        if(condConsumer_.wait_for(locker,std::chrono::seconds(timeout))
-            == std::cv_status::timeout)
-            return false;
-        if(isClose_)
-            return false;
-    }
-    item = deq_.front();
-    deq_.pop_front();
-    condProducer_.notify_one();
-    return true;
-}
 #endif

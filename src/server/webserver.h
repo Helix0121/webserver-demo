@@ -1,69 +1,82 @@
-
 #ifndef WEBSERVER_H
 #define WEBSERVER_H
 
-#include <unordered_map>
-#include <fcntl.h>       // fcntl()
-#include <unistd.h>      // close()
-#include <assert.h>
-#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <cassert>
+#include <sys/epoll.h>
 
-#include "epoller.h"
-#include "../log/log.h"
-#include "../timer/heaptimer.h"
-#include "../pool/sqlconnpool.h"
 #include "../pool/threadpool.h"
-#include "../pool/sqlconnRAII.h"
 #include "../http/httpconn.h"
+
+const int MAX_FD = 65536;           //最大文件描述符
+const int MAX_EVENT_NUMBER = 10000; //最大事件数
+const int TIMESLOT = 5;             //最小超时单位
 
 class WebServer
 {
 public:
-    WebServer(
-        int port,int trigMode,int timeoutMS,bool OptLinger,
-        int sqlPort,const char* sqlUser,const char* sqlPwd,
-        const char* dbName,int connPoolNum,int threadNum,
-        bool openLog,int LogLevel,int logQueSize);
-    
+    WebServer();
     ~WebServer();
-    void Start();
-private:
-    bool InitSocket_();
-    void InitEventMode_(int trigMode);
-    void AddClient_(int fd,sockaddr_in addr);
 
-    void DealListen_();
-    void DealWrite_(HttpConn* client);
-    void DealRead_(HttpConn* client);
+    void init(int port , string user, string passWord, string databaseName,
+              int log_write , int opt_linger, int trigmode, int sql_num,
+              int thread_num, int close_log, int actor_model);
 
-    void SendError(int fd,const char* info);
-    void ExtentTime_(HttpConn* client);
-    void CloseConn_(HttpConn* client);
+    void thread_pool();
+    void sql_pool();
+    void log_write();
+    void trig_mode();
+    void eventListen();
+    void eventLoop();
+    void timer(int connfd, struct sockaddr_in client_address);
+    void adjust_timer(util_timer *timer);
+    void deal_timer(util_timer *timer, int sockfd);
+    bool dealclinetdata();
+    bool dealwithsignal(bool& timeout, bool& stop_server);
+    void dealwithread(int sockfd);
+    void dealwithwrite(int sockfd);
 
-    void OnRead_(HttpConn* client);
-    void OnWrite_(HttpConn* client);
-    void OnProcess(HttpConn* client);
+public:
+    //基础
+    int m_port;
+    char *m_root;
+    int m_log_write;
+    int m_close_log;
+    int m_actormodel;
 
-    static const int MAX_FD = 65536;
+    int m_pipefd[2];
+    int m_epollfd;
+    http_conn *users;
 
-    static int SetFdNonblock(int fd);
+    //数据库相关
+    connection_pool *m_connPool;
+    string m_user;         //登陆数据库用户名
+    string m_passWord;     //登陆数据库密码
+    string m_databaseName; //使用数据库名
+    int m_sql_num;
 
-    int port_;
-    bool openLinger_;
-    int timeoutMS_;
-    bool isClose_;
-    int listenFd_;
-    char* srcDir_;
+    //线程池相关
+    threadpool<http_conn> *m_pool;
+    int m_thread_num;
 
-    uint32_t listenEvent_;
-    uint32_t connEvent_;
+    //epoll_event相关
+    epoll_event events[MAX_EVENT_NUMBER];
 
-    std::unique_ptr<HeapTimer> timer_;
-    std::unique_ptr<ThreadPool> threadpool_;
-    std::unique_ptr<Epoller> epoller_;
-    std::unordered_map<int,HttpConn> users_;
+    int m_listenfd;
+    int m_OPT_LINGER;
+    int m_TRIGMode;
+    int m_LISTENTrigmode;
+    int m_CONNTrigmode;
+
+    //定时器相关
+    client_data *users_timer;
+    Utils utils;
 };
 #endif
